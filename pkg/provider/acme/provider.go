@@ -2,8 +2,10 @@ package acme
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -41,6 +43,12 @@ import (
 
 const resolverSuffix = ".acme"
 
+// renewLockTTL is the lifetime of the per-domain renewal lock. It must be
+// larger than the longest certificate renewal (ACME challenge solving and DNS
+// propagation), so that a Traefik instance crashing mid-renewal cannot block
+// the renewal of a certificate for longer than this duration.
+const renewLockTTL = 30 * time.Minute
+
 // Configuration holds ACME configuration provided by users.
 type Configuration struct {
 	Email                string   `description:"Email address used for registration." json:"email,omitempty" toml:"email,omitempty" yaml:"email,omitempty"`
@@ -49,7 +57,7 @@ type Configuration struct {
 	Profile              string   `description:"Certificate profile to use." json:"profile,omitempty" toml:"profile,omitempty" yaml:"profile,omitempty" export:"true"`
 	EmailAddresses       []string `description:"CSR email addresses to use." json:"emailAddresses,omitempty" toml:"emailAddresses,omitempty" yaml:"emailAddresses,omitempty"`
 	DisableCommonName    bool     `description:"Disable the common name in the CSR." json:"disableCommonName,omitempty" toml:"disableCommonName,omitempty" yaml:"disableCommonName,omitempty" export:"true"`
-	Storage              string   `description:"Storage to use." json:"storage,omitempty" toml:"storage,omitempty" yaml:"storage,omitempty" export:"true"`
+	Storage              string   `description:"Storage to use. It can be a local file path, or a Redis URL (redis://, rediss:// or redis+sentinel://) to use a distributed storage." json:"storage,omitempty" toml:"storage,omitempty" yaml:"storage,omitempty" export:"true"`
 	KeyType              string   `description:"KeyType used for generating certificate private key. Allow value 'EC256', 'EC384', 'RSA2048', 'RSA4096', 'RSA8192'." json:"keyType,omitempty" toml:"keyType,omitempty" yaml:"keyType,omitempty" export:"true"`
 	EAB                  *EAB     `description:"External Account Binding to use." json:"eab,omitempty" toml:"eab,omitempty" yaml:"eab,omitempty"`
 	CertificatesDuration int      `description:"Certificates' duration in hours." json:"certificatesDuration,omitempty" toml:"certificatesDuration,omitempty" yaml:"certificatesDuration,omitempty" export:"true"`
@@ -925,44 +933,101 @@ func (p *Provider) renewCertificates(ctx context.Context, renewPeriod time.Durat
 	p.certificatesMu.RUnlock()
 
 	for _, cert := range certificates {
-		client, err := p.getClient()
+		// Acquire the per-domain renewal lock so that several Traefik
+		// instances sharing the same storage do not renew the same
+		// certificate at the same time.
+		token, acquired, err := p.tryLockCertificate(ctx, cert.Domain)
 		if err != nil {
-			logger.Info().Err(err).Msgf("Error renewing ACME certificate: %+v", cert.Domain)
+			logger.Info().Err(err).Msgf("Error locking renewal of ACME certificate: %+v", cert.Domain)
+			continue
+		}
+		if !acquired {
+			logger.Info().Msgf("Skipping renewal of ACME certificate %+v: renewal is locked by another instance", cert.Domain)
 			continue
 		}
 
-		logger.Info().Msgf("Renewing ACME certificate: %+v", cert.Domain)
+		func() {
+			defer p.unlockCertificate(ctx, cert.Domain, token)
 
-		res := certificate.Resource{
-			ID:          cert.Domain.Main,
-			Domains:     cert.Domain.ToStrArray(),
-			PrivateKey:  cert.Key,
-			Certificate: cert.Certificate.Certificate,
-		}
+			client, err := p.getClient()
+			if err != nil {
+				logger.Info().Err(err).Msgf("Error renewing ACME certificate: %+v", cert.Domain)
+				return
+			}
 
-		opts := &certificate.RenewOptions{
-			Bundle:         true,
-			EmailAddresses: p.EmailAddresses,
-			Profile:        p.Profile,
-			PreferredChain: p.PreferredChain,
-		}
+			logger.Info().Msgf("Renewing ACME certificate: %+v", cert.Domain)
 
-		renewedCert, err := client.Certificate.Renew(ctx, res, opts)
-		if err != nil {
-			logger.Error().Err(err).Msgf("Error renewing ACME certificate: %v", cert.Domain)
-			continue
-		}
+			res := certificate.Resource{
+				ID:          cert.Domain.Main,
+				Domains:     cert.Domain.ToStrArray(),
+				PrivateKey:  cert.Key,
+				Certificate: cert.Certificate.Certificate,
+			}
 
-		if len(renewedCert.Certificate) == 0 || len(renewedCert.PrivateKey) == 0 {
-			logger.Error().Msgf("domains %v renew certificate with no value: %v", cert.Domain.ToStrArray(), cert)
-			continue
-		}
+			opts := &certificate.RenewOptions{
+				Bundle:         true,
+				EmailAddresses: p.EmailAddresses,
+				Profile:        p.Profile,
+				PreferredChain: p.PreferredChain,
+			}
 
-		err = p.addCertificateForDomain(cert.Domain, renewedCert, cert.Store)
-		if err != nil {
-			logger.Error().Err(err).Msg("Error adding certificate for domain")
-		}
+			renewedCert, err := client.Certificate.Renew(ctx, res, opts)
+			if err != nil {
+				logger.Error().Err(err).Msgf("Error renewing ACME certificate: %v", cert.Domain)
+				return
+			}
+
+			if len(renewedCert.Certificate) == 0 || len(renewedCert.PrivateKey) == 0 {
+				logger.Error().Msgf("domains %v renew certificate with no value: %v", cert.Domain.ToStrArray(), cert)
+				return
+			}
+
+			err = p.addCertificateForDomain(cert.Domain, renewedCert, cert.Store)
+			if err != nil {
+				logger.Error().Err(err).Msg("Error adding certificate for domain")
+			}
+		}()
 	}
+}
+
+// tryLockCertificate tries to acquire the renewal lock for the given domain.
+// It returns the lock token and true on success. When the Store does not
+// support locking, it returns an empty token and true, so the renewal
+// proceeds without coordination.
+func (p *Provider) tryLockCertificate(ctx context.Context, domain types.Domain) (string, bool, error) {
+	lockable, ok := p.Store.(LockableStore)
+	if !ok {
+		return "", true, nil
+	}
+
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", false, fmt.Errorf("unable to generate renewal lock token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	acquired, err := lockable.Lock(ctx, renewalLockName(domain), token, renewLockTTL)
+	if err != nil {
+		return "", false, fmt.Errorf("unable to acquire renewal lock for %v: %w", domain, err)
+	}
+
+	return token, acquired, nil
+}
+
+// unlockCertificate releases the renewal lock for the given domain.
+func (p *Provider) unlockCertificate(ctx context.Context, domain types.Domain, token string) {
+	lockable, ok := p.Store.(LockableStore)
+	if !ok {
+		return
+	}
+
+	if err := lockable.Unlock(ctx, renewalLockName(domain), token); err != nil {
+		log.Ctx(ctx).Error().Err(err).Msgf("Error releasing renewal lock for %v", domain)
+	}
+}
+
+func renewalLockName(domain types.Domain) string {
+	return strings.Join(domain.ToStrArray(), ",")
 }
 
 // Get provided certificate which check a domains list (Main and SANs)

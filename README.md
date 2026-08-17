@@ -1,3 +1,6 @@
+This fork provides Redis as the certificate store provider, whereas the default and the only option was only a JSON file.
+
+---
 
 <p align="center">
     <picture>

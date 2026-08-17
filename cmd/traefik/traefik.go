@@ -196,7 +196,10 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		return nil, err
 	}
 
-	acmeProviders := initACMEProvider(staticConfiguration, providerAggregator, tlsManager, httpChallengeProvider, tlsChallengeProvider, routinesPool)
+	acmeProviders, err := initACMEProvider(staticConfiguration, providerAggregator, tlsManager, httpChallengeProvider, tlsChallengeProvider, routinesPool)
+	if err != nil {
+		return nil, err
+	}
 
 	// Tailscale
 
@@ -453,8 +456,8 @@ func switchRouter(routerFactory *server.RouterFactory, serverEntryPointsTCP serv
 }
 
 // initACMEProvider creates and registers acme.Provider instances corresponding to the configured ACME certificate resolvers.
-func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, tlsManager *traefiktls.Manager, httpChallengeProvider, tlsChallengeProvider challenge.Provider, routinesPool *safe.Pool) []*acme.Provider {
-	localStores := map[string]*acme.LocalStore{}
+func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, tlsManager *traefiktls.Manager, httpChallengeProvider, tlsChallengeProvider challenge.Provider, routinesPool *safe.Pool) ([]*acme.Provider, error) {
+	stores := map[string]acme.Store{}
 
 	var resolvers []*acme.Provider
 	for name, resolver := range c.CertificatesResolvers {
@@ -462,13 +465,17 @@ func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.Pr
 			continue
 		}
 
-		if localStores[resolver.ACME.Storage] == nil {
-			localStores[resolver.ACME.Storage] = acme.NewLocalStore(resolver.ACME.Storage, routinesPool)
+		if stores[resolver.ACME.Storage] == nil {
+			store, err := acme.NewStore(resolver.ACME.Storage, routinesPool)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create storage for ACME resolver %q: %w", name, err)
+			}
+			stores[resolver.ACME.Storage] = store
 		}
 
 		p := &acme.Provider{
 			Configuration:         resolver.ACME,
-			Store:                 localStores[resolver.ACME.Storage],
+			Store:                 stores[resolver.ACME.Storage],
 			ResolverName:          name,
 			HTTPChallengeProvider: httpChallengeProvider,
 			TLSChallengeProvider:  tlsChallengeProvider,
@@ -486,7 +493,7 @@ func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.Pr
 		resolvers = append(resolvers, p)
 	}
 
-	return resolvers
+	return resolvers, nil
 }
 
 // initTailscaleProviders creates and registers tailscale.Provider instances corresponding to the configured Tailscale certificate resolvers.
