@@ -13,8 +13,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var _ Store = (*RedisStore)(nil)
-var _ LockableStore = (*RedisStore)(nil)
+var (
+	_ Store         = (*RedisStore)(nil)
+	_ LockableStore = (*RedisStore)(nil)
+)
 
 const (
 	// defaultRedisKeyPrefix is the key prefix under which the ACME stored data
@@ -99,7 +101,8 @@ type RedisStore struct {
 	keyPrefix string
 }
 
-// NewRedisStore initializes a new RedisStore from a Redis URL.
+// NewRedisStore initializes a new RedisStore from a Redis URL and fails when
+// the server is unreachable.
 //
 // Supported URL schemes:
 //
@@ -107,17 +110,27 @@ type RedisStore struct {
 //	rediss://[user:password@]host:port[/db]           Redis over TLS
 //	redis+sentinel://[user:password@]host1:port1[,host2:port2][/db]?masterName=<name>[&sentinelUsername=<user>&sentinelPassword=<pass>]
 func NewRedisStore(redisURL string) (*RedisStore, error) {
+	return newRedisStore(redisURL, true)
+}
+
+// newRedisStore initializes a new RedisStore from a Redis URL. When
+// checkConnection is false, an unreachable server does not prevent the store
+// creation: operations then fail and are handled by the caller (used by the
+// failover store, so Traefik can start while the primary store is down).
+func newRedisStore(redisURL string, checkConnection bool) (*RedisStore, error) {
 	client, err := newRedisClient(redisURL)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), redisClientTimeout)
-	defer cancel()
+	if checkConnection {
+		ctx, cancel := context.WithTimeout(context.Background(), redisClientTimeout)
+		defer cancel()
 
-	if err := client.Ping(ctx).Err(); err != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("unable to connect to Redis: %w", err)
+		if err := client.Ping(ctx).Err(); err != nil {
+			_ = client.Close()
+			return nil, fmt.Errorf("unable to connect to Redis: %w", err)
+		}
 	}
 
 	return &RedisStore{client: client, keyPrefix: defaultRedisKeyPrefix}, nil

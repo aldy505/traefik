@@ -1,4 +1,57 @@
-This fork provides Redis as the certificate store provider, whereas the default and the only option was only a JSON file.
+# Certificate store backends
+
+This fork extends the ACME certificate storage beyond the default local JSON file: `certificatesResolvers.<name>.acme.storage` also accepts a Redis or etcd URL, so several Traefik instances can share the same certificates and renewals.
+
+## Local JSON file (default)
+
+```toml
+[certificatesResolvers.myresolver.acme]
+email = "foo@example.com"
+storage = "acme.json"
+```
+
+## Redis
+
+```toml
+[certificatesResolvers.myresolver.acme]
+email = "foo@example.com"
+storage = "redis://:password@redis-1:6379/0"
+```
+
+Supported schemes:
+
+- `redis://[user:password@]host:port[/db]` — plain Redis
+- `rediss://[user:password@]host:port[/db]` — Redis over TLS
+- `redis+sentinel://[user:password@]sentinel1:26379,sentinel2:26379[/db]?masterName=<name>[&sentinelUsername=<user>&sentinelPassword=<pass>]` — Redis Sentinel
+
+## etcd
+
+```toml
+[certificatesResolvers.myresolver.acme]
+email = "foo@example.com"
+storage = "etcd://etcd-1:2379,etcd-2:2379"
+```
+
+Supported schemes:
+
+- `etcd://[user:password@]host1:port1[,host2:port2][/key-prefix]` — plain etcd
+- `etcds://[user:password@]host1:port1[,host2:port2][/key-prefix]` — etcd over TLS
+
+`http://` and `https://` are accepted as aliases of `etcd://` and `etcds://`. The URL path, when present, overrides the default `traefik/acme` key prefix.
+
+## Local fallback (dual-write)
+
+Any Redis or etcd storage can be paired with a local JSON file by appending a `file` query parameter:
+
+```toml
+[certificatesResolvers.myresolver.acme]
+email = "foo@example.com"
+storage = "etcd://etcd-1:2379?file=/var/traefik/acme.json"
+```
+
+The data is then written to both the distributed store and the file, and reads fall back to the file when the distributed store is unreachable — Traefik can even start while the distributed store is down, as long as the file holds the certificates. When the distributed store comes back, it catches up with the renewals that only reached the file.
+
+With a shared distributed store, Traefik instances also coordinate certificate renewals with per-domain locks, so two instances never renew the same certificate at the same time. The locks expire automatically, so a crashed instance does not block renewals.
 
 ---
 

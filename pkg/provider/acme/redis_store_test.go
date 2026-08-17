@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -574,6 +575,7 @@ func TestNewStore(t *testing.T) {
 	redisServer := miniredis.RunT(t)
 
 	redisAddr := redisServer.Addr()
+	etcdAddr := sharedTestEtcdAddr(t)
 
 	testCases := []struct {
 		desc    string
@@ -600,9 +602,53 @@ func TestNewStore(t *testing.T) {
 			},
 		},
 		{
+			desc:    "etcd url",
+			storage: "etcd://" + etcdAddr,
+			store: func(t *testing.T, store Store) {
+				t.Helper()
+				_, ok := store.(*EtcdStore)
+				require.True(t, ok)
+			},
+		},
+		{
+			desc:    "redis url with file fallback",
+			storage: "redis://" + redisAddr + "?file=" + filepath.Join(t.TempDir(), "acme.json"),
+			store: func(t *testing.T, store Store) {
+				t.Helper()
+				failover, ok := store.(*FailoverStore)
+				require.True(t, ok)
+
+				_, ok = failover.primary.(*RedisStore)
+				require.True(t, ok)
+
+				_, ok = failover.fallback.(*LocalStore)
+				require.True(t, ok)
+			},
+		},
+		{
+			desc:    "etcd url with file fallback",
+			storage: "etcd://" + etcdAddr + "?file=" + filepath.Join(t.TempDir(), "acme.json"),
+			store: func(t *testing.T, store Store) {
+				t.Helper()
+				failover, ok := store.(*FailoverStore)
+				require.True(t, ok)
+
+				_, ok = failover.primary.(*EtcdStore)
+				require.True(t, ok)
+
+				_, ok = failover.fallback.(*LocalStore)
+				require.True(t, ok)
+			},
+		},
+		{
 			desc:    "unsupported redis scheme",
 			storage: "redis-cluster://" + redisAddr,
 			err:     `unsupported Redis URL scheme "redis-cluster" for storage "redis-cluster://` + redisAddr + `"`,
+		},
+		{
+			desc:    "unsupported etcd scheme",
+			storage: "etcd-cluster://" + etcdAddr,
+			err:     `unsupported etcd URL scheme "etcd-cluster" for storage "etcd-cluster://` + etcdAddr + `"`,
 		},
 	}
 
